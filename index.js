@@ -112,7 +112,10 @@ function normalizeEmail(email) {
 
 function createUserStore(databasePath = DEFAULT_DATABASE_PATH) {
   if (databasePath !== ':memory:') {
-    fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+    // Restrict access to password hashes; SQLite journal files inherit the database file's mode.
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true, mode: 0o700 });
+    fs.closeSync(fs.openSync(databasePath, 'a', 0o600));
+    fs.chmodSync(databasePath, 0o600);
   }
 
   const db = new DatabaseSync(databasePath);
@@ -157,7 +160,8 @@ function createUserStore(databasePath = DEFAULT_DATABASE_PATH) {
   };
 }
 
-function createLoginLimiter({ maxAttempts = 5, maxAttemptsPerIp = 50, windowMs = 15 * 60 * 1000 } = {}) {
+// The per-IP limit is opt-in: it blocks every account behind a shared IP or proxy.
+function createLoginLimiter({ maxAttempts = 5, maxAttemptsPerIp = Infinity, windowMs = 15 * 60 * 1000 } = {}) {
   const failures = new Map();
 
   function activeEntry(key, now) {
@@ -217,10 +221,18 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
   requireSecret(secret);
 
   const router = express.Router();
+  const ownsUserStore = !options.userStore;
   const userStore = options.userStore || createUserStore(options.databasePath);
   const loginLimiter = options.loginLimiter || createLoginLimiter(options.loginLimit);
 
-  router.post('/register', async (req, res) => {
+  // Closes the user store only if this router created it; caller-supplied stores stay open.
+  router.close = () => {
+    if (ownsUserStore) {
+      userStore.close();
+    }
+  };
+
+  router.post('/register', async (req, res, next) => {
     const { password } = req.body || {};
     const email = normalizeEmail((req.body || {}).email);
 
@@ -228,8 +240,12 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    if (userStore.findUserByEmail(email)) {
-      return res.status(409).json({ error: 'User already exists' });
+    try {
+      if (userStore.findUserByEmail(email)) {
+        return res.status(409).json({ error: 'User already exists' });
+      }
+    } catch (error) {
+      return next(error);
     }
 
     let passwordHash;
@@ -239,7 +255,13 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
       return res.status(400).json({ error: error.message || 'Unable to create user' });
     }
 
-    const user = userStore.createUser({ email, passwordHash });
+    let user;
+    try {
+      user = userStore.createUser({ email, passwordHash });
+    } catch (error) {
+      return next(error);
+    }
+
     if (!user) {
       return res.status(409).json({ error: 'User already exists' });
     }
@@ -250,7 +272,7 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
     });
   });
 
-  router.post('/login', async (req, res) => {
+  router.post('/login', async (req, res, next) => {
     const { password } = req.body || {};
     const email = normalizeEmail((req.body || {}).email);
 
@@ -265,21 +287,31 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
       return res.status(429).json({ error: 'Too many failed login attempts; try again later' });
     }
 
+    let user;
     try {
-      const user = userStore.findUserByEmail(email);
-      const valid = user ? await comparePassword(password, user.passwordHash) : false;
+      user = userStore.findUserByEmail(email);
+    } catch (error) {
+      return next(error);
+    }
 
-      if (!valid) {
-        loginLimiter.recordFailure(ip, email);
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
+    let valid = false;
+    try {
+      valid = user ? await comparePassword(password, user.passwordHash) : false;
+    } catch (error) {
+      valid = false;
+    }
 
+    if (!valid) {
+      loginLimiter.recordFailure(ip, email);
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    try {
       loginLimiter.recordSuccess(ip, email);
       const token = generateToken({ sub: user.id, email: user.email }, secret);
       return res.json({ token, user: { id: user.id, email: user.email } });
     } catch (error) {
-      loginLimiter.recordFailure(ip, email);
-      return res.status(401).json({ error: 'Invalid credentials' });
+      return next(error);
     }
   });
 
@@ -289,8 +321,10 @@ function createAuthRouter(secret = DEFAULT_SECRET, options = {}) {
 function createApp(secret = DEFAULT_SECRET, options = {}) {
   const app = express();
 
+  const authRouter = createAuthRouter(secret, options);
+
   app.use(express.json());
-  app.use('/auth', createAuthRouter(secret, options));
+  app.use('/auth', authRouter);
 
   app.get('/health', (req, res) => {
     res.json({ status: 'ok' });
@@ -299,6 +333,18 @@ function createApp(secret = DEFAULT_SECRET, options = {}) {
   app.get('/profile', authenticate(secret), (req, res) => {
     res.json({ user: req.user });
   });
+
+  // eslint-disable-next-line no-unused-vars
+  app.use((error, req, res, next) => {
+    const status = error.status || error.statusCode || 500;
+    if (status >= 500) {
+      // eslint-disable-next-line no-console
+      console.error(error);
+    }
+    res.status(status).json({ error: error.expose ? error.message : 'Internal server error' });
+  });
+
+  app.close = () => authRouter.close();
 
   return app;
 }
@@ -340,10 +386,14 @@ class AuthService {
 if (require.main === module) {
   const app = createApp();
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     // eslint-disable-next-line no-console
     console.log(`Auth service listening on port ${port}`);
   });
+
+  const shutdown = () => server.close(() => app.close());
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 module.exports = {

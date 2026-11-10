@@ -6,6 +6,8 @@ const os = require('os');
 const path = require('path');
 const {
   AuthService,
+  createLoginLimiter,
+  createUserStore,
   hashPassword,
   comparePassword,
   generateToken,
@@ -117,7 +119,12 @@ async function withServer(app, fn) {
     return await fn(server);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    app.close();
   }
+}
+
+function makeTempDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'auth-test-'));
 }
 
 describe('security hardening', () => {
@@ -141,7 +148,7 @@ describe('security hardening', () => {
 
 describe('auth routes', () => {
   test('registered accounts survive a restart', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-test-'));
+    const dir = makeTempDir();
     const databasePath = path.join(dir, 'users.db');
 
     try {
@@ -194,5 +201,99 @@ describe('auth routes', () => {
       const blocked = await requestJson(server, 'POST', '/auth/login', {}, { email: 'a@example.com', password: 'alpha' });
       expect(blocked.statusCode).toBe(429);
     });
+  });
+
+  test('database errors return 500 without crashing the server', async () => {
+    const failingStore = {
+      findUserByEmail() {
+        return null;
+      },
+      createUser() {
+        throw new Error('database or disk is full');
+      },
+      close() {},
+    };
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await withServer(createApp('test-secret', { userStore: failingStore }), async (server) => {
+        const register = await requestJson(server, 'POST', '/auth/register', {}, { email: 'a@example.com', password: 'pw' });
+        expect(register.statusCode).toBe(500);
+        expect(register.body.error).toBe('Internal server error');
+
+        failingStore.findUserByEmail = () => {
+          throw new Error('database is locked');
+        };
+        const login = await requestJson(server, 'POST', '/auth/login', {}, { email: 'a@example.com', password: 'pw' });
+        expect(login.statusCode).toBe(500);
+
+        const health = await requestJson(server, 'GET', '/health');
+        expect(health.statusCode).toBe(200);
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
+  test('malformed JSON still returns 400', async () => {
+    await withServer(createApp('test-secret', { databasePath: ':memory:' }), async (server) => {
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: server.address().port,
+          path: '/auth/login',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        });
+        req.on('error', reject);
+        req.end('{bad json');
+      });
+      expect(response).toBe(400);
+    });
+  });
+});
+
+describe('resource and access controls', () => {
+  test('app.close releases only the internally created store', () => {
+    const ownedApp = createApp('test-secret', { databasePath: ':memory:' });
+    expect(() => ownedApp.close()).not.toThrow();
+    expect(() => ownedApp.close()).toThrow(/not open/);
+
+    const sharedStore = createUserStore(':memory:');
+    const sharedApp = createApp('test-secret', { userStore: sharedStore });
+    sharedApp.close();
+    expect(sharedStore.findUserByEmail('a@example.com')).toBeNull();
+    sharedStore.close();
+  });
+
+  test('database file is only readable by its owner', () => {
+    const dir = makeTempDir();
+    const databasePath = path.join(dir, 'nested', 'users.db');
+
+    try {
+      const store = createUserStore(databasePath);
+      store.close();
+      expect(fs.statSync(databasePath).mode & 0o777).toBe(0o600);
+      expect(fs.statSync(path.dirname(databasePath)).mode & 0o777).toBe(0o700);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('per-IP limit is off by default and opt-in', () => {
+    const limiter = createLoginLimiter({ maxAttempts: 3 });
+    for (let i = 0; i < 100; i += 1) {
+      limiter.recordFailure('1.2.3.4', `user${i}@example.com`);
+    }
+    expect(limiter.retryAfter('1.2.3.4', 'victim@example.com')).toBe(0);
+
+    const strict = createLoginLimiter({ maxAttempts: 3, maxAttemptsPerIp: 10 });
+    for (let i = 0; i < 10; i += 1) {
+      strict.recordFailure('1.2.3.4', `user${i}@example.com`);
+    }
+    expect(strict.retryAfter('1.2.3.4', 'victim@example.com')).toBeGreaterThan(0);
   });
 });
