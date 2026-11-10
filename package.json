@@ -1,1 +1,28 @@
-{\n  "name": "test-auth",\n  "version": "1.0.0",\n  "description": "JWT authentication system",\n  "main": "index.js",\n  "scripts": {\n    "start": "node index.js",\n    "test": "jest"\n  },\n  "keywords": ["jwt", "authentication"],\n  "author": "",\n  "license": "ISC",\n  "dependencies": {\n    "jsonwebtoken": "^9.1.2",\n    "bcryptjs": "^2.4.3",\n    "express": "^4.18.2",\n    "dotenv": "^16.3.1"\n  },\n  "devDependencies": {\n    "jest": "^29.7.0"\n  }\n}
+{
+  "name": "test-auth",
+  "version": "1.0.0",
+  "description": "JWT authentication system",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "jest"
+  },
+  "keywords": [
+    "jwt",
+    "authentication"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "jsonwebtoken": "^9.0.2",
+    "bcryptjs": "^2.4.3",
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
